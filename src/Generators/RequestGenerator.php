@@ -379,4 +379,19 @@ END;
                 return $result;
             });
     }
+
+    public function getDependencies(): Collection
+    {
+        // TODO: Implement getDependencies() method.
+    }
+
+    protected function getDefinitionContent(): ?string
+    {
+        // TODO: Implement getDefinitionContent() method.
+    }
+
+    protected function getDependenciesContent(): Collection
+    {
+        // TODO: Implement getDependenciesContent() method.
+    }
 }

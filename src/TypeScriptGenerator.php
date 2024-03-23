@@ -2,6 +2,7 @@
 
 namespace Based\TypeScript;
 
+use Based\TypeScript\Contracts\Generator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use ReflectionClass;
@@ -11,17 +12,33 @@ use Symfony\Component\Finder\Finder;
 
 class TypeScriptGenerator
 {
+    /** @var Generator[] $generators */
+    public array $generators;
+    public string $output;
+    public bool $autoloadDev;
+    public array $paths = [];
+    /** @var Collection<string,string> */
+    protected array $classesToGenerate;
+
     public function __construct(
-        public array $generators,
-        public string $output,
-        public bool $autoloadDev,
-        public array $paths = []
+        $generators,
+        $output,
+        $autoloadDev,
+        $paths = []
     ) {
+        $this->paths = $paths;
+        $this->autoloadDev = $autoloadDev;
+        $this->output = $output;
+        $this->generators = $generators;
     }
 
     public function execute()
     {
-        $types = $this->phpClasses()
+        $classes = $this->getPHPClasses();
+        $this->classesToGenerate = $this->getDependencies($classes);
+
+
+        $types = $classes
             ->groupBy(fn (ReflectionClass $reflection) => $reflection->getNamespaceName())
             ->map(fn (Collection $reflections, string $namespace) => $this->makeNamespace($namespace, $reflections))
             ->reject(fn (string $namespaceDefinition) => empty($namespaceDefinition))
@@ -40,10 +57,45 @@ class TypeScriptGenerator
         file_put_contents($this->output, $types);
     }
 
+    protected function getDependencies(Collection $classes): array
+    {
+        $dependencies = $classes
+            ->map(fn(ReflectionClass $reflection) => $this->getDependentClasses($reflection))
+            ->whereNotNull()
+            ->collapse()
+            ->unique()
+            ->intersect($classes);
+        return $dependencies->toArray();
+    }
+
+    protected function getGenerator(ReflectionClass $reflection): ?string
+    {
+        return collect($this->generators)
+            ->filter(fn (string $generator, string $baseClass) => $reflection->isSubclassOf($baseClass))
+            ->values()
+            ->first();
+    }
+
+    protected function getDependentClasses(ReflectionClass $reflection): Collection
+    {
+        $generator = $this->getGenerator($reflection);
+
+        if (!$generator) {
+            return collect();
+        }
+
+        $dependencies = (new $generator($reflection))->getDependencies();
+
+        return $dependencies
+            ->map(fn (string $class) => new ReflectionClass($class))
+            ->filter(fn (ReflectionClass $class) => $this->getGenerator($class));
+    }
+
     protected function makeNamespace(string $namespace, Collection $reflections): string
     {
-        return $reflections->map(fn (ReflectionClass $reflection) => $this->makeInterface($reflection))
+        return $reflections->map(fn (ReflectionClass $reflection) => $this->makeDefinition($reflection))
             ->whereNotNull()
+            ->map(fn (string $definition) => indent($definition) . PHP_EOL)
             ->whenNotEmpty(function (Collection $definitions) use ($namespace) {
                 $tsNamespace = str_replace('\\', '.', $namespace);
 
@@ -52,21 +104,19 @@ class TypeScriptGenerator
             ->join(PHP_EOL);
     }
 
-    protected function makeInterface(ReflectionClass $reflection): ?string
+    protected function makeDefinition(ReflectionClass $reflection): ?string
     {
-        $generator = collect($this->generators)
-            ->filter(fn (string $generator, string $baseClass) => $reflection->isSubclassOf($baseClass))
-            ->values()
-            ->first();
+        /** @var Generator $generator */
+        $generator = $this->getGenerator($reflection);
 
         if (!$generator) {
             return null;
         }
 
-        return (new $generator)->generate($reflection);
+        return (new $generator($reflection, $this->classesToGenerate))->getDefinition();
     }
 
-    protected function phpClasses(): Collection
+    protected function getPHPClasses(): Collection
     {
         $composer = json_decode(file_get_contents(realpath('composer.json')));
 

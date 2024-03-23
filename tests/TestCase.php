@@ -4,11 +4,15 @@ namespace Based\TypeScript\Tests;
 
 use Based\TypeScript\TypeScriptServiceProvider;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Schema;
 use Orchestra\Testbench\TestCase as Orchestra;
+use function Orchestra\Testbench\workbench_path;
 
 class TestCase extends Orchestra
 {
+    use RefreshDatabase;
+
     public function setUp(): void
     {
         parent::setUp();
@@ -21,38 +25,13 @@ class TestCase extends Orchestra
         ];
     }
 
-    public function getEnvironmentSetUp($app)
+    protected function defineEnvironment($app)
     {
-        config()->set('database.default', 'testing');
-
-        $this->migrateDatabase();
+        $app['config']->set('database.default', 'testing');
     }
 
-    public function migrateDatabase()
+    public function defineDatabaseMigrations()
     {
-        Schema::create('categories', function (Blueprint $table) {
-            $table->id();
-            $table->string('name');
-            $table->json('data')->nullable();
-            $table->unsignedInteger('position');
-            $table->timestamps();
-        });
-
-        Schema::create('products', function (Blueprint $table) {
-            $table->id();
-            $table->foreignId('category_id');
-            $table->foreignId('sub_category_id')->constrained('categories');
-            $table->string('name');
-            $table->decimal('price');
-            $table->json('data')->nullable();
-            $table->timestamps();
-        });
-
-        Schema::create('features', function (Blueprint $table) {
-            $table->id();
-            $table->foreignId('product_id');
-            $table->string('body');
-            $table->timestamps();
-        });
+        $this->loadMigrationsFrom(workbench_path('database/migrations'));
     }
 }

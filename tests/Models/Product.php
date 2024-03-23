@@ -37,4 +37,9 @@ class Product extends Model
     {
         return true;
     }
+
+    public function getClassTypedAccessorAttribute(): User
+    {
+        return new User();
+    }
 }

@@ -2,11 +2,12 @@
 
 namespace Based\TypeScript\Contracts;
 
+use Illuminate\Support\Collection;
 use ReflectionClass;
 
 interface Generator
 {
-    public function generate(ReflectionClass $reflection): ?string;
-
     public function getDefinition(): ?string;
+
+    public function getDependencies(): Collection;
 }

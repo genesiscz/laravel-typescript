@@ -4,8 +4,9 @@ namespace Based\TypeScript\Generators;
 
 use Based\TypeScript\Definitions\TypeScriptProperty;
 use Based\TypeScript\Definitions\TypeScriptType;
+use Based\TypeScript\Generators\TypeScript\AbstractInterfaceGenerator;
 use Doctrine\DBAL\Schema\Column;
-use Doctrine\DBAL\Types\Types;
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -19,39 +20,22 @@ use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
-use Illuminate\Support\Facades\DB;
 use ReflectionClass;
+use ReflectionFunction;
 use ReflectionMethod;
+use ReflectionNamedType;
+use ReflectionType;
+use ReflectionUnionType;
 use Throwable;
 
-class ModelGenerator extends AbstractGenerator
+class ModelGenerator extends AbstractInterfaceGenerator
 {
     protected Model $model;
     /** @var Collection<Column> */
     protected Collection $columns;
+    /** @var Collection<string,ReflectionClass> */
+    protected Collection $casts;
 
-    public function __construct()
-    {
-        // Enums aren't supported by DBAL, so map enum columns to string.
-        DB::getDoctrineSchemaManager()->getDatabasePlatform()->registerDoctrineTypeMapping('enum', 'string');
-    }
-
-    public function getDefinition(): ?string
-    {
-        return collect([
-            $this->getProperties(),
-            $this->getRelations(),
-            $this->getManyRelations(),
-            $this->getAccessors(),
-        ])
-            ->filter(fn (string $part) => !empty($part))
-            ->join(PHP_EOL . '        ');
-    }
-
-    /**
-     * @throws \Doctrine\DBAL\Exception
-     * @throws \ReflectionException
-     */
     protected function boot(): void
     {
         $this->model = $this->reflection->newInstance();
@@ -61,30 +45,150 @@ class ModelGenerator extends AbstractGenerator
                 ->getDoctrineSchemaManager()
                 ->listTableColumns($this->model->getConnection()->getTablePrefix() . $this->model->getTable())
         );
+        $this->casts = $this->getCasts();
     }
 
-    protected function getProperties(): string
+    protected function getDefinitionContent(): ?string
+    {
+        return collect([
+            $this->getPropertyDefinitions(),
+            $this->getRelationDefinitions(),
+            $this->getManyRelationDefinitions(),
+            $this->getAccessorDefinitions(),
+            $this->getAttributeAccessorDefinitions(),
+        ])
+            ->filter(fn (string $part) => !empty($part))
+            ->join(PHP_EOL);
+    }
+
+    protected function getDependenciesContent(): Collection
+    {
+        return collect([
+            $this->getPropertyClasses(),
+            $this->getRelationClasses(),
+            $this->getAccessorClasses(),
+            $this->getAttributeAccessorClasses(),
+        ])
+            ->collapse()
+            ->values()
+            ->unique();
+    }
+
+    protected function getCasts(): Collection
+    {
+        return collect($this->model->getCasts());
+    }
+
+    protected function getPropertyClasses(): Collection
     {
         return $this->columns->map(function (Column $column) {
-            return (string) new TypeScriptProperty(
-                name: $column->getName(),
-                types: $this->getPropertyType($column->getType()->getName()),
-                nullable: !$column->getNotnull()
-            );
-        })
-            ->join(PHP_EOL . '        ');
+            if (!$this->casts->has($column->getName())) {
+                return null;
+            }
+
+            $cast = $this->casts
+                ->filter(fn (string $cast) => class_exists($cast))
+                ->get($column->getName());
+            if (!$cast) return null;
+
+            return (new ReflectionClass($cast))->getName();
+        })->filter();
     }
 
-    protected function getAccessors(): string
+    protected function getPropertyDefinitions(): string
+    {
+        return $this->columns->map(function (Column $column) {
+            // Types should be based on return type to start with
+            $types = TypeScriptType::fromNativeType($column->getType()->getName());
+
+            // Check if the model has a cast for this column
+            if ($this->casts->has($column->getName())) {
+
+                // Set the type to the eloquent cast
+                $cast = $this->casts->get($column->getName());
+                $types = TypeScriptType::fromEloquentType($cast);
+
+                // If the cast is a class, override the type
+                if (class_exists($cast)) {
+                    // Get cast class of this column
+                    $reflection = new ReflectionClass($cast);
+
+                    // If class is going to be generated at some point, use its name, or fallback to return type
+                    if (in_array($reflection, $this->knownClasses)) {
+                        $types = str_replace('\\', '.', $reflection->getName());
+                    }
+                }
+            }
+            return (string) new TypeScriptProperty(
+                name: $column->getName(),
+                types: $types,
+                nullable: !$column->getNotnull()
+            );
+        })->join(PHP_EOL);
+    }
+
+    protected function getRelationClasses(): Collection
+    {
+        return $this->getRelationMethods()
+            ->map(function (ReflectionMethod $method) {
+                return $this->getRelationRelatedClass($method);
+            });
+    }
+
+    protected function getRelationDefinitions(): string
+    {
+        return $this->getRelationMethods()
+            ->map(function (ReflectionMethod $method) {
+                return (string) new TypeScriptProperty(
+                    name: Str::snake($method->getName()),
+                    types: $this->getRelationType($method),
+                    optional: true,
+                    nullable: true
+                );
+            })
+            ->join(PHP_EOL);
+    }
+
+    protected function getManyRelationDefinitions(): string
+    {
+        return $this->getRelationMethods()
+            ->filter(fn (ReflectionMethod $method) => $this->isManyRelation($method))
+            ->map(function (ReflectionMethod $method) {
+                return (string) new TypeScriptProperty(
+                    name: Str::snake($method->getName()) . '_count',
+                    types: TypeScriptType::NUMBER,
+                    optional: true,
+                    nullable: true
+                );
+            })
+            ->join(PHP_EOL);
+    }
+
+    protected function getAccessorClasses(): Collection
+    {
+        return $this->getAccessors()
+            ->map(function (ReflectionMethod $method) {
+                $types = $method->getReturnType() instanceof ReflectionUnionType
+                    ? collect($method->getReturnType()->getTypes())
+                    : collect([$method->getReturnType()]);
+
+                return $types
+                    ->reject(fn (?ReflectionType $type) => is_null($type) || $type->isBuiltin())
+                    ->filter(fn (?ReflectionType $type) => $type instanceof ReflectionNamedType)
+                    ->reject(fn (ReflectionNamedType $type) => $type->getName() == "null")
+                    ->map(fn (ReflectionNamedType $type) => $type->getName());
+            })
+            ->collapse();
+    }
+
+    protected function getAccessorDefinitions(): string
     {
         $relationsToSkip =  $this->getRelationMethods()
             ->map(function (ReflectionMethod $method) {
                 return Str::snake($method->getName());
             });
 
-        return $this->getMethods()
-            ->filter(fn (ReflectionMethod $method) => Str::startsWith($method->getName(), 'get'))
-            ->filter(fn (ReflectionMethod $method) => Str::endsWith($method->getName(), 'Attribute'))
+        return $this->getAccessors()
             ->mapWithKeys(function (ReflectionMethod $method) {
                 $property = (string) Str::of($method->getName())
                     ->between('get', 'Attribute')
@@ -102,41 +206,42 @@ class ModelGenerator extends AbstractGenerator
                 return (string) new TypeScriptProperty(
                     name: $property,
                     types: TypeScriptType::fromMethod($method),
-                    optional: true,
+                    optional: !$this->model->hasAppended($property),
                     readonly: true
                 );
             })
-            ->join(PHP_EOL . '        ');
+            ->join(PHP_EOL);
     }
 
-    protected function getRelations(): string
+    protected function getAttributeAccessorClasses(): Collection
     {
-        return $this->getRelationMethods()
-            ->map(function (ReflectionMethod $method) {
-                return (string) new TypeScriptProperty(
-                    name: Str::snake($method->getName()),
-                    types: $this->getRelationType($method),
-                    optional: true,
-                    nullable: true
-                );
-            })
-            ->join(PHP_EOL . '        ');
+        return $this->getAttributeAccessors()
+            ->map(fn (ReflectionFunction $function, string $property) => $function->getReturnType()->getName());
     }
 
-    protected function getManyRelations(): string
+    protected function getAttributeAccessorDefinitions(): string
     {
-        return $this->getRelationMethods()
-            ->filter(fn (ReflectionMethod $method) => $this->isManyRelation($method))
-            ->map(function (ReflectionMethod $method) {
+        return $this->getAttributeAccessors()
+            ->map(function (ReflectionFunction $function, string $property) {
+                // Optional only if not in appends.
                 return (string) new TypeScriptProperty(
-                    name: Str::snake($method->getName()) . '_count',
-                    types: TypeScriptType::NUMBER,
-                    optional: true,
-                    nullable: true
+                    name: $property,
+                    types: $this->getKnownClassOrType($function->getReturnType()->getName()),
+                    optional: !$this->model->hasAppended($property),
+                    readonly: true,
+                    nullable: true,
                 );
             })
-            ->join(PHP_EOL . '        ');
+            ->join(PHP_EOL);
     }
+
+    protected function getMethods(): Collection
+    {
+        return collect($this->reflection->getMethods(ReflectionMethod::IS_PUBLIC))
+            ->reject(fn (ReflectionMethod $method) => $method->isStatic())
+            ->reject(fn (ReflectionMethod $method) => $method->getNumberOfParameters());
+    }
+
 
     protected function getRelationMethods(): Collection
     {
@@ -159,56 +264,52 @@ class ModelGenerator extends AbstractGenerator
             });
     }
 
-    protected function getMethods(): Collection
+    protected function getAccessors(): Collection
     {
-        return collect($this->reflection->getMethods(ReflectionMethod::IS_PUBLIC))
-            ->reject(fn (ReflectionMethod $method) => $method->isStatic())
-            ->reject(fn (ReflectionMethod $method) => $method->getNumberOfParameters());
+        return $this->getMethods()
+            ->filter(fn (ReflectionMethod $method) => Str::startsWith($method->getName(), 'get'))
+            ->filter(fn (ReflectionMethod $method) => Str::endsWith($method->getName(), 'Attribute'));
     }
 
-    protected function getPropertyType(string $type): string|array
+    protected function getAttributeAccessors(): Collection
     {
-        return match ($type) {
-            Types::ARRAY => [TypeScriptType::array(), TypeScriptType::ANY],
-            Types::ASCII_STRING => TypeScriptType::STRING,
-            Types::BIGINT => TypeScriptType::NUMBER,
-            Types::BINARY => TypeScriptType::STRING,
-            Types::BLOB => TypeScriptType::STRING,
-            Types::BOOLEAN => TypeScriptType::BOOLEAN,
-            Types::DATE_MUTABLE => TypeScriptType::STRING,
-            Types::DATE_IMMUTABLE => TypeScriptType::STRING,
-            Types::DATEINTERVAL => TypeScriptType::STRING,
-            Types::DATETIME_MUTABLE => TypeScriptType::STRING,
-            Types::DATETIME_IMMUTABLE => TypeScriptType::STRING,
-            Types::DATETIMETZ_MUTABLE => TypeScriptType::STRING,
-            Types::DATETIMETZ_IMMUTABLE => TypeScriptType::STRING,
-            Types::DECIMAL => TypeScriptType::NUMBER,
-            Types::FLOAT => TypeScriptType::NUMBER,
-            Types::GUID => TypeScriptType::STRING,
-            Types::INTEGER => TypeScriptType::NUMBER,
-            Types::JSON => [TypeScriptType::array(), TypeScriptType::ANY],
-            Types::OBJECT => TypeScriptType::ANY,
-            Types::SIMPLE_ARRAY => [TypeScriptType::array(), TypeScriptType::ANY],
-            Types::SMALLINT => TypeScriptType::NUMBER,
-            Types::STRING => TypeScriptType::STRING,
-            Types::TEXT => TypeScriptType::STRING,
-            Types::TIME_MUTABLE => TypeScriptType::NUMBER,
-            Types::TIME_IMMUTABLE => TypeScriptType::NUMBER,
-            default => TypeScriptType::ANY,
-        };
+        return collect($this->reflection->getMethods())
+            ->filter(fn (ReflectionMethod $method) =>
+                $method->hasReturnType()
+                && $method->getReturnType() instanceof ReflectionNamedType
+                && $method->getReturnType()->getName() === Attribute::class
+            )
+            ->mapWithKeys(function (ReflectionMethod $method) {
+                $property = Str::snake($method->getName());
+                $method->setAccessible(true);
+                $returnAttribute = $method->invoke($this->model);
+                $reflectFn = new ReflectionFunction($returnAttribute->get);
+                return [$property => $reflectFn];
+            })
+            ->reject(function (ReflectionFunction $function, string $property) {
+                return $this->columns->contains(fn (Column $column) => $column->getName() === $property) ||
+                    !$function->hasReturnType();
+            });
+    }
+
+    protected function getRelationRelatedClass(ReflectionMethod $method): string
+    {
+        $relationReturn = $method->invoke($this->model);
+        return get_class($relationReturn->getRelated());
     }
 
     protected function getRelationType(ReflectionMethod $method): string
     {
-        $relationReturn = $method->invoke($this->model);
-        $related = str_replace('\\', '.', get_class($relationReturn->getRelated()));
+        $relationClass = $this->getRelationRelatedClass($method);
+        $related = $this->getKnownClassOrType($relationClass);
+        $relatedRef = str_replace('\\', '.', $related);
 
         if ($this->isManyRelation($method)) {
-            return TypeScriptType::array($related);
+            return TypeScriptType::array($relatedRef);
         }
 
-        if ($this->isOneRelattion($method)) {
-            return $related;
+        if ($this->isOneRelation($method)) {
+            return $relatedRef;
         }
 
         return TypeScriptType::ANY;
@@ -230,7 +331,7 @@ class ModelGenerator extends AbstractGenerator
         );
     }
 
-    protected function isOneRelattion(ReflectionMethod $method): bool
+    protected function isOneRelation(ReflectionMethod $method): bool
     {
         $relationType = get_class($method->invoke($this->model));
 
