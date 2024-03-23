@@ -81,7 +81,13 @@ declare namespace Based.TypeScript.Tests.Models {
         created_at: string | null;
         updated_at: string | null;
         roles?: Array<Based.TypeScript.Tests.Models.Role> | null;
+        notifications?: Array<any> | null;
+        read_notifications?: Array<any> | null;
+        unread_notifications?: Array<any> | null;
         roles_count?: number | null;
+        notifications_count?: number | null;
+        read_notifications_count?: number | null;
+        unread_notifications_count?: number | null;
         readonly first_name?: Based.TypeScript.Tests.Models.User | null;
     }
 

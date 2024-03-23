@@ -252,15 +252,6 @@ class ModelGenerator extends AbstractInterfaceGenerator
                 } catch (Throwable) {
                     return false;
                 }
-            })
-            // [TODO] Resolve trait/parent relations as well (e.g. DatabaseNotification)
-            // skip traits for awhile
-            ->filter(function (ReflectionMethod $method) {
-                return collect($this->reflection->getTraits())
-                    ->filter(function (ReflectionClass $trait) use ($method) {
-                        return $trait->hasMethod($method->name);
-                    })
-                    ->isEmpty();
             });
     }
 
