@@ -1,5 +1,5 @@
 {
-    "name": "based/laravel-typescript",
+    "name": "genesiscz/laravel-typescript",
     "description": "Transform Laravel models into TypeScript interfaces",
     "keywords": [
         "laravel",
